@@ -51,7 +51,7 @@ TEMPERATURE  = _llm_cfg.get("temperature", 0.3)
 MAX_TOKENS   = _llm_cfg.get("max_tokens",  512)
 STOP_TOKENS  = ["\n使用者:", "\n員工:", "\n問題:", "使用者：", "員工："]
 
-DEFAULT_MODEL = "taide-lx-7b-chat"
+DEFAULT_MODEL = "gpt-4.1-nano"
 
 _MAX_HISTORY_TURNS = 20
 
@@ -202,12 +202,12 @@ def _build_taide_prompt(messages: list[ChatCompletionMessageParam]) -> str:
 
 # ── 後端：LM Studio REST API（fallback）─────────────────────────────────────
 
-class _LMStudioBackend:
-    """透過 LM Studio OpenAI 相容 API 呼叫（需開啟 Server）。"""
+class _OpenAIBackend:
+    """使用 OpenAI 官方 API 作為後端。"""
 
-    def __init__(self, model: str = DEFAULT_MODEL):
+    def __init__(self, api_key: str, model: str = DEFAULT_MODEL):
         from openai import OpenAI
-        self._client = OpenAI(base_url="http://localhost:1234/v1", api_key="lm-studio")
+        self._client = OpenAI(api_key=api_key)
         self._model = model
 
     def chat(self, messages: list[ChatCompletionMessageParam]) -> str:
@@ -248,20 +248,18 @@ class LMStudioChat:
         if self._backend is not None:
             return "already_init"
 
-        # 嘗試 LlamaCpp
-        if Path(self._model_path).exists():
-            try:
-                self._backend = _LlamaCppBackend(self._model_path)
-                return "llamacpp"
-            except Exception as e:
-                logger.warning("LlamaCpp 初始化失敗，改用 LM Studio：%s", e)
-
-        # Fallback：LM Studio REST API
+        # 使用 OpenAI 後端（需於 config.toml 中設定 [openai].api_key 或環境變數）
+        api_key = _cfg.get("openai", {}).get("api_key") or None
+        if not api_key:
+            import os
+            api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            raise RuntimeError("缺少 OpenAI API key，請於 config.toml 中設定 [openai].api_key 或設置環境變數 OPENAI_API_KEY")
         try:
-            self._backend = _LMStudioBackend(self._model)
-            return "lmstudio"
+            self._backend = _OpenAIBackend(api_key=api_key, model=self._model)
+            return "openai"
         except Exception as e:
-            raise RuntimeError(f"所有後端均初始化失敗：{e}")
+            raise RuntimeError(f"OpenAI 初始化失敗：{e}")
 
     # ── 私有 ────────────────────────────────────────────────────────────────
 
@@ -333,24 +331,17 @@ class LMStudioChat:
 
     @staticmethod
     def check_server() -> bool:
-        """檢查 LM Studio Server（fallback 路徑用）。"""
-        import socket
-        try:
-            with socket.create_connection(("127.0.0.1", 1234), timeout=2):
-                return True
-        except Exception:
-            return False
+        """檢查 OpenAI API key 是否設定（簡易檢查）。"""
+        api_key = _cfg.get("openai", {}).get("api_key") or None
+        if not api_key:
+            import os
+            api_key = os.environ.get("OPENAI_API_KEY")
+        return bool(api_key)
 
     @staticmethod
     def llamacpp_available() -> bool:
-        """檢查 LlamaCpp 和 GGUF 模型是否都可用。"""
-        if not Path(TAIDE_MODEL_PATH).exists():
-            return False
-        try:
-            from langchain_community.llms import LlamaCpp  # noqa
-            return True
-        except ImportError:
-            return False
+        """舊檢查：保留為檢查本地 TAIDE 模型的存在性（向後相容）。"""
+        return Path(TAIDE_MODEL_PATH).exists()
 
 
 # ── 模組級別行為指標分析（子 process 隔離，防止 llama.cpp abort 崩潰）────────
@@ -404,15 +395,18 @@ def _worker_main(tasks: list, q):
     import re as _re, json as _json
     from pathlib import Path as _Path
 
-    # 建立後端（子 process 內獨立初始化）
-    backend = None
-    if _Path(TAIDE_MODEL_PATH).exists():
-        try:
-            backend = _LlamaCppBackend(TAIDE_MODEL_PATH)
-        except Exception:
-            pass
-    if backend is None:
-        backend = _LMStudioBackend()
+    # 建立後端（子 process 內獨立初始化）—改用 OpenAI
+    api_key = _cfg.get("openai", {}).get("api_key") or None
+    if not api_key:
+        import os
+        api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        # 無 API key：回傳空結果給每個任務
+        for idx, _ in tasks:
+            q.put((idx, []))
+        q.put(None)
+        return
+    backend = _OpenAIBackend(api_key=api_key, model=_cfg.get("openai", {}).get("model", DEFAULT_MODEL))
 
     for idx, task_args in tasks:
         try:
